@@ -1,8 +1,8 @@
 <?php
-session_start();
+require_once 'includes/common.php';
+
 if (isset($_SESSION['user'])) {
-    header('Location: dashboard.php');
-    exit;
+    redirect('dashboard.php');
 }
-header('Location: login.php');
-exit;
+
+redirect('login.php');
