@@ -1,175 +1,298 @@
 <?php
-require 'db.php';
-session_start();
+require_once 'includes/common.php';
+require_login();
+require_permission('inventory.in.create');
 
-if (!isset($_SESSION['user'])) {
-    header("Location: login.php");
-    exit;
-}
-
-$user = $_SESSION['user'];
-$name = $user['name'];
-$role = ucfirst($user['role']);
-
-function formatDateToMonthYear($date)
-{
-    return date('m/Y', strtotime($date));
-}
-
+$products = fetch_products($conn, ['status' => 'active']);
 $errors = [];
 $old = [
-    'product_type' => $_POST['product_type'] ?? 'existing',
-    'existing_product' => $_POST['existing_product'] ?? '',
-    'generic_name' => $_POST['generic_name'] ?? '',
-    'brand_name' => $_POST['brand_name'] ?? '',
-    'dosage_strength' => $_POST['dosage_strength'] ?? '',
-    'batch_no' => $_POST['batch_no'] ?? '',
-    'mfg_date' => $_POST['mfg_date'] ?? '',
-    'exp_date' => $_POST['exp_date'] ?? '',
-    'manufacturer' => $_POST['manufacturer'] ?? '',
-    'registration_no' => $_POST['registration_no'] ?? '',
-    'qty_in' => $_POST['qty_in'] ?? '',
-    'source' => $_POST['source'] ?? 'regular',
-    'distributor_name' => $_POST['distributor_name'] ?? '',
+    'product_mode' => trim((string) ($_POST['product_mode'] ?? 'existing')),
+    'existing_product_id' => trim((string) ($_POST['existing_product_id'] ?? '')),
+    'generic_name' => trim((string) ($_POST['generic_name'] ?? '')),
+    'brand_name' => trim((string) ($_POST['brand_name'] ?? '')),
+    'dosage_strength' => trim((string) ($_POST['dosage_strength'] ?? '')),
+    'manufacturer' => trim((string) ($_POST['manufacturer'] ?? '')),
+    'registration_no' => trim((string) ($_POST['registration_no'] ?? '')),
+    'default_low_stock_threshold' => trim((string) ($_POST['default_low_stock_threshold'] ?? '10')),
+    'product_type' => trim((string) ($_POST['product_type'] ?? 'medicine')),
+    'barcode_value' => trim((string) ($_POST['barcode_value'] ?? '')),
+    'source' => trim((string) ($_POST['source'] ?? 'regular')),
+    'batch_no' => trim((string) ($_POST['batch_no'] ?? '')),
+    'qty_in' => trim((string) ($_POST['qty_in'] ?? '')),
+    'mfg_date' => trim((string) ($_POST['mfg_date'] ?? '')),
+    'exp_date' => trim((string) ($_POST['exp_date'] ?? '')),
+    'distributor_name' => trim((string) ($_POST['distributor_name'] ?? '')),
+    'importer_name' => trim((string) ($_POST['importer_name'] ?? '')),
+    'low_stock_threshold' => trim((string) ($_POST['low_stock_threshold'] ?? '10')),
+    'note_text' => trim((string) ($_POST['note_text'] ?? '')),
 ];
 
-$productOptions = [];
-$productDetails = [];
-$sql1 = "SELECT DISTINCT generic_name, brand_name, dosage_strength, manufacturer, registration_no FROM inventory";
-$sql2 = "SELECT DISTINCT generic_name, brand_name, dosage_strength, manufacturer, registration_no FROM inventory_outsourced";
-$result1 = $conn->query($sql1);
-$result2 = $conn->query($sql2);
-foreach ([$result1, $result2] as $result) {
-    if ($result && $result->num_rows > 0) {
-        while ($row = $result->fetch_assoc()) {
-            $key = $row['generic_name'] . '|' . $row['brand_name'] . '|' . $row['dosage_strength'];
-            $productOptions[$key] = true;
-            $productDetails[$key] = [
-                'manufacturer' => $row['manufacturer'],
-                'registration_no' => $row['registration_no']
-            ];
+if (request_is_post()) {
+    verify_csrf_or_fail();
+
+    $mode = $old['product_mode'] === 'new' ? 'new' : 'existing';
+    $source = $old['source'] === 'outsourced' ? 'outsourced' : 'regular';
+    $batchNo = $old['batch_no'];
+    $qtyIn = max(1, (int) $old['qty_in']);
+    $mfgDate = date_input_to_month_year($old['mfg_date']);
+    $expDate = date_input_to_month_year($old['exp_date']);
+    $distributor = $old['distributor_name'];
+    $importer = $old['importer_name'];
+    $threshold = max(1, (int) $old['low_stock_threshold']);
+    $noteText = $old['note_text'];
+    $product = null;
+
+    if ($batchNo === '') {
+        $errors[] = 'Batch number is required.';
+    } elseif (batch_exists($conn, $batchNo)) {
+        $errors[] = 'Batch number already exists.';
+    }
+
+    if ($mfgDate === '' || $expDate === '') {
+        $errors[] = 'Manufacturing and expiry dates are required.';
+    }
+
+    if ($source === 'outsourced' && $distributor === '') {
+        $errors[] = 'Distributor name is required for outsourced entries.';
+    }
+
+    if ($mode === 'existing') {
+        $product = fetch_product_by_id($conn, (int) $old['existing_product_id']);
+        if (!$product || ($product['product_status'] ?? 'active') !== 'active') {
+            $errors[] = 'Please select a valid active product.';
         }
-    }
-}
-
-function batch_exists(mysqli $conn, string $batchNo): bool {
-    $stmt = $conn->prepare("SELECT batch_no FROM inventory WHERE batch_no = ? LIMIT 1");
-    $stmt->bind_param('s', $batchNo);
-    $stmt->execute();
-    $found = (bool)$stmt->get_result()->fetch_assoc();
-    $stmt->close();
-    if ($found) return true;
-
-    $stmt = $conn->prepare("SELECT batch_no FROM inventory_outsourced WHERE batch_no = ? LIMIT 1");
-    $stmt->bind_param('s', $batchNo);
-    $stmt->execute();
-    $found = (bool)$stmt->get_result()->fetch_assoc();
-    $stmt->close();
-    return $found;
-}
-
-if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    $type = trim($_POST['product_type'] ?? '');
-
-    if ($type !== 'existing' && $type !== 'new') {
-        $errors[] = 'Please select whether this is an existing or new product.';
+    } else {
+        $productPayload = product_payload_from_request($_POST);
+        $errors = array_merge($errors, validate_product_payload($conn, $productPayload));
     }
 
-    if ($type === 'existing') {
-        $existingProduct = trim($_POST['existing_product'] ?? '');
-        $batch_no = trim($_POST['batch_no'] ?? '');
-        $mfg_date_raw = trim($_POST['mfg_date'] ?? '');
-        $exp_date_raw = trim($_POST['exp_date'] ?? '');
-        $manufacturer = trim($_POST['manufacturer'] ?? '');
-        $registration_no = trim($_POST['registration_no'] ?? '');
-        $qty_in = isset($_POST['qty_in']) ? (int) $_POST['qty_in'] : 0;
-
-        if ($existingProduct === '') $errors[] = 'Please select an existing product.';
-        if ($batch_no === '') $errors[] = 'Batch number is required.';
-        if ($mfg_date_raw === '' || $exp_date_raw === '') $errors[] = 'Manufacturing date and expiry date are required.';
-        if ($qty_in <= 0) $errors[] = 'Quantity IN must be greater than zero.';
-        if ($batch_no !== '' && batch_exists($conn, $batch_no)) $errors[] = 'This batch number already exists. Please use a unique batch number.';
-
-        if (!$errors) {
-            list($generic_name, $brand_name, $dosage_strength) = explode('|', $existingProduct);
-            $mfg_date = formatDateToMonthYear($mfg_date_raw);
-            $exp_date = formatDateToMonthYear($exp_date_raw);
-
-            $stmt = $conn->prepare("INSERT INTO inventory (generic_name, brand_name, dosage_strength, batch_no, mfg_date, exp_date, manufacturer, registration_no, qty_in, qty, qty_out, qty_returned) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0)");
-            $stmt->bind_param("ssssssssii", $generic_name, $brand_name, $dosage_strength, $batch_no, $mfg_date, $exp_date, $manufacturer, $registration_no, $qty_in, $qty_in);
-            $stmt->execute();
-            $stmt->close();
-
-            $stmt = $conn->prepare("INSERT INTO in_log (batch_no, added_by, added_at) VALUES (?, ?, NOW())");
-            $stmt->bind_param("ss", $batch_no, $name);
-            $stmt->execute();
-            $stmt->close();
-
-            header("Location: dashboard.php");
-            exit;
-        }
-    }
-
-    if ($type === 'new') {
-        $generic_name = trim($_POST['generic_name'] ?? '');
-        $brand_name = trim($_POST['brand_name'] ?? '');
-        $dosage_strength = trim($_POST['dosage_strength'] ?? '');
-        $batch_no = trim($_POST['batch_no'] ?? '');
-        $mfg_date_raw = trim($_POST['mfg_date'] ?? '');
-        $exp_date_raw = trim($_POST['exp_date'] ?? '');
-        $manufacturer = trim($_POST['manufacturer'] ?? '');
-        $registration_no = trim($_POST['registration_no'] ?? '');
-        $qty_in = isset($_POST['qty_in']) ? (int) $_POST['qty_in'] : 0;
-        $source = trim($_POST['source'] ?? 'regular');
-        $distributor_name = trim($_POST['distributor_name'] ?? '');
-
-        if ($generic_name === '' || $brand_name === '' || $dosage_strength === '') $errors[] = 'Generic name, brand name, and dosage strength are required.';
-        if ($batch_no === '') $errors[] = 'Batch number is required.';
-        if ($mfg_date_raw === '' || $exp_date_raw === '') $errors[] = 'Manufacturing date and expiry date are required.';
-        if ($qty_in <= 0) $errors[] = 'Quantity IN must be greater than zero.';
-        if ($source === 'outsourced' && $distributor_name === '') $errors[] = 'Distributor name is required for outside sourced products.';
-        if ($batch_no !== '' && batch_exists($conn, $batch_no)) $errors[] = 'This batch number already exists. Please use a unique batch number.';
-
-        if (!$errors) {
-            $mfg_date = formatDateToMonthYear($mfg_date_raw);
-            $exp_date = formatDateToMonthYear($exp_date_raw);
+    if (!$errors) {
+        $conn->begin_transaction();
+        try {
+            if ($mode === 'new') {
+                $productId = create_product_record($conn, $productPayload);
+                $product = fetch_product_by_id($conn, $productId);
+                if (!$product) {
+                    throw new RuntimeException('The new product could not be created.');
+                }
+            }
 
             if ($source === 'outsourced') {
-                $stmt = $conn->prepare("INSERT INTO inventory_outsourced (generic_name, brand_name, dosage_strength, batch_no, mfg_date, exp_date, manufacturer, registration_no, distributor_name, qty_in, qty, qty_out, qty_returned) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0)");
-                $stmt->bind_param("sssssssssii", $generic_name, $brand_name, $dosage_strength, $batch_no, $mfg_date, $exp_date, $manufacturer, $registration_no, $distributor_name, $qty_in, $qty_in);
+                $stmt = $conn->prepare(
+                    'INSERT INTO inventory_outsourced
+                    (product_id, generic_name, brand_name, dosage_strength, batch_no, mfg_date, exp_date, manufacturer, registration_no, importer_name, distributor_name, qty_in, qty, qty_out, qty_returned, low_stock_threshold, record_status, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, "active", NOW(), NOW())'
+                );
+                $stmt->bind_param(
+                    'issssssssssiii',
+                    $product['id'],
+                    $product['generic_name'],
+                    $product['brand_name'],
+                    $product['dosage_strength'],
+                    $batchNo,
+                    $mfgDate,
+                    $expDate,
+                    $product['manufacturer'],
+                    $product['registration_no'],
+                    $importer,
+                    $distributor,
+                    $qtyIn,
+                    $qtyIn,
+                    $threshold
+                );
+                $stmt->execute();
+                $inventoryId = (int) $stmt->insert_id;
+                $stmt->close();
+                $inventoryTable = 'inventory_outsourced';
+                $targetType = 'batch_outsourced';
             } else {
-                $stmt = $conn->prepare("INSERT INTO inventory (generic_name, brand_name, dosage_strength, batch_no, mfg_date, exp_date, manufacturer, registration_no, qty_in, qty, qty_out, qty_returned) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0)");
-                $stmt->bind_param("ssssssssii", $generic_name, $brand_name, $dosage_strength, $batch_no, $mfg_date, $exp_date, $manufacturer, $registration_no, $qty_in, $qty_in);
+                $stmt = $conn->prepare(
+                    'INSERT INTO inventory
+                    (product_id, generic_name, brand_name, dosage_strength, batch_no, mfg_date, exp_date, manufacturer, registration_no, qty_in, qty, qty_out, qty_returned, low_stock_threshold, record_status, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, "active", NOW(), NOW())'
+                );
+                $stmt->bind_param(
+                    'issssssssiii',
+                    $product['id'],
+                    $product['generic_name'],
+                    $product['brand_name'],
+                    $product['dosage_strength'],
+                    $batchNo,
+                    $mfgDate,
+                    $expDate,
+                    $product['manufacturer'],
+                    $product['registration_no'],
+                    $qtyIn,
+                    $qtyIn,
+                    $threshold
+                );
+                $stmt->execute();
+                $inventoryId = (int) $stmt->insert_id;
+                $stmt->close();
+                $inventoryTable = 'inventory';
+                $targetType = 'batch_regular';
             }
+
+            $actor = current_user_actor();
+            $stmt = $conn->prepare(
+                'INSERT INTO in_log
+                (generic_name, brand_name, dosage_strength, batch_no, inventory_table, inventory_ref_id, product_id, mfg_date, exp_date, manufacturer, registration_no, qty_in, source_type, added_by, added_at, record_status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), "active")'
+            );
+            $stmt->bind_param(
+                'sssssiissssiss',
+                $product['generic_name'],
+                $product['brand_name'],
+                $product['dosage_strength'],
+                $batchNo,
+                $inventoryTable,
+                $inventoryId,
+                $product['id'],
+                $mfgDate,
+                $expDate,
+                $product['manufacturer'],
+                $product['registration_no'],
+                $qtyIn,
+                $source,
+                $actor['name']
+            );
             $stmt->execute();
+            $inLogId = (int) $stmt->insert_id;
             $stmt->close();
 
-            $stmt = $conn->prepare("INSERT INTO in_log (batch_no, added_by, added_at) VALUES (?, ?, NOW())");
-            $stmt->bind_param("ss", $batch_no, $name);
-            $stmt->execute();
-            $stmt->close();
+            if ($noteText !== '' && user_can('notes.add')) {
+                add_note_record($conn, $targetType, $inventoryId, $noteText);
+                add_note_record($conn, 'in_log', $inLogId, $noteText);
+            }
 
-            header("Location: dashboard.php");
-            exit;
+            log_audit(
+                $conn,
+                'create',
+                $targetType,
+                $inventoryId,
+                'Created IN batch',
+                null,
+                [],
+                [
+                    'batch_no' => $batchNo,
+                    'qty_in' => $qtyIn,
+                    'source' => $source,
+                    'product_id' => $product['id'],
+                ]
+            );
+
+            $conn->commit();
+            set_flash('success', 'Inventory IN saved successfully for batch ' . $batchNo . '.');
+            redirect('dashboard.php');
+        } catch (Throwable $exception) {
+            $conn->rollback();
+            $errors[] = 'Unable to save the IN transaction: ' . $exception->getMessage();
         }
     }
 }
 ?>
-<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Inventory IN</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet"><link rel="stylesheet" href="assets/app.css"></head><body>
-<div class="app-shell app-shell-form"><section class="card form-page-card"><div class="form-page-top"><div><div class="eyebrow">Inventory Transaction</div><h1 class="hero-page-title">Inventory IN</h1><p class="hero-page-subtitle">Add a new regular or outsourced batch without changing the existing table structure.</p></div><a class="btn btn-soft" href="dashboard.php">Back to Dashboard</a></div>
-<?php if ($errors): ?><div class="flash flash-error"><?php foreach ($errors as $error): ?><div><?php echo htmlspecialchars($error); ?></div><?php endforeach; ?></div><?php endif; ?>
-<form method="POST" class="form-page-form">
-<div class="form-block form-mode-group"><div class="form-section-label">Product Type</div><div class="segmented segmented-large"><label class="segment-card"><input type="radio" name="product_type_selector" value="existing" <?php echo $old['product_type'] === 'existing' ? 'checked' : ''; ?> onclick="toggleProductType('existing')"><span>Existing Product</span></label><label class="segment-card"><input type="radio" name="product_type_selector" value="new" <?php echo $old['product_type'] === 'new' ? 'checked' : ''; ?> onclick="toggleProductType('new')"><span>New Product</span></label></div></div>
-<input type="hidden" name="product_type" id="product_type" value="<?php echo htmlspecialchars($old['product_type']); ?>">
-<div id="existingFields" class="form-block"><div class="form-block-head"><h2 class="section-title">Existing product entry</h2><p class="section-subtitle">Select an existing product profile, then log the new batch information.</p></div><div class="form-grid"><div class="field field-full"><label for="existing_product">Existing Product</label><select name="existing_product" id="existing_product" onchange="fillProductDetails(this)"><option value="">Select product</option><?php foreach (array_keys($productOptions) as $option): ?><option value="<?php echo htmlspecialchars($option); ?>" <?php echo $old['existing_product'] === $option ? 'selected' : ''; ?>><?php echo htmlspecialchars(str_replace('|', ' • ', $option)); ?></option><?php endforeach; ?></select></div><div class="field"><label for="batch_no_existing">Batch No</label><input type="text" id="batch_no_existing" name="batch_no" value="<?php echo htmlspecialchars($old['batch_no']); ?>" placeholder="Enter batch number"></div><div class="field"><label for="qty_in_existing">Qty IN</label><input type="number" id="qty_in_existing" name="qty_in" min="1" value="<?php echo htmlspecialchars($old['qty_in']); ?>" placeholder="Enter quantity"></div><div class="field"><label for="mfg_date_existing">Manufacturing Date</label><input type="date" id="mfg_date_existing" name="mfg_date" value="<?php echo htmlspecialchars($old['mfg_date']); ?>"></div><div class="field"><label for="exp_date_existing">Expiry Date</label><input type="date" id="exp_date_existing" name="exp_date" value="<?php echo htmlspecialchars($old['exp_date']); ?>"></div><div class="field"><label for="manufacturer_existing">Manufacturer</label><input type="text" id="manufacturer_existing" name="manufacturer" value="<?php echo htmlspecialchars($old['manufacturer']); ?>" placeholder="Manufacturer"></div><div class="field"><label for="registration_no_existing">Registration No</label><input type="text" id="registration_no_existing" name="registration_no" value="<?php echo htmlspecialchars($old['registration_no']); ?>" placeholder="Registration number"></div></div></div>
-<div id="newFields" class="form-block"><div class="form-block-head"><h2 class="section-title">New product entry</h2><p class="section-subtitle">Create a completely new regular or outsourced product batch.</p></div><div class="form-grid"><div class="field"><label for="generic_name">Generic Name</label><input type="text" id="generic_name" name="generic_name" value="<?php echo htmlspecialchars($old['generic_name']); ?>" placeholder="Generic name"></div><div class="field"><label for="brand_name">Brand Name</label><input type="text" id="brand_name" name="brand_name" value="<?php echo htmlspecialchars($old['brand_name']); ?>" placeholder="Brand name"></div><div class="field"><label for="dosage_strength">Dosage & Strength</label><input type="text" id="dosage_strength" name="dosage_strength" value="<?php echo htmlspecialchars($old['dosage_strength']); ?>" placeholder="e.g. 500mg, 2mg/mL"></div><div class="field"><label for="batch_no_new">Batch No</label><input type="text" id="batch_no_new" name="batch_no" value="<?php echo htmlspecialchars($old['batch_no']); ?>" placeholder="Enter batch number"></div><div class="field"><label for="qty_in_new">Qty IN</label><input type="number" id="qty_in_new" name="qty_in" min="1" value="<?php echo htmlspecialchars($old['qty_in']); ?>" placeholder="Enter quantity"></div><div class="field"><label for="manufacturer_new">Manufacturer</label><input type="text" id="manufacturer_new" name="manufacturer" value="<?php echo htmlspecialchars($old['manufacturer']); ?>" placeholder="Manufacturer"></div><div class="field"><label for="mfg_date_new">Manufacturing Date</label><input type="date" id="mfg_date_new" name="mfg_date" value="<?php echo htmlspecialchars($old['mfg_date']); ?>"></div><div class="field"><label for="exp_date_new">Expiry Date</label><input type="date" id="exp_date_new" name="exp_date" value="<?php echo htmlspecialchars($old['exp_date']); ?>"></div><div class="field"><label for="registration_no_new">Registration No</label><input type="text" id="registration_no_new" name="registration_no" value="<?php echo htmlspecialchars($old['registration_no']); ?>" placeholder="Registration number"></div><div class="field field-full"><label>Product Source</label><div class="segmented"><label><input type="radio" name="source" value="regular" <?php echo $old['source'] === 'regular' ? 'checked' : ''; ?> onclick="toggleSourceOption('regular')">In-House</label><label><input type="radio" name="source" value="outsourced" <?php echo $old['source'] === 'outsourced' ? 'checked' : ''; ?> onclick="toggleSourceOption('outsourced')">Outside Sourced</label></div></div><div class="field field-full" id="distributorField"><label for="distributor_name">Distributor Name</label><input type="text" id="distributor_name" name="distributor_name" value="<?php echo htmlspecialchars($old['distributor_name']); ?>" placeholder="Distributor name"></div></div></div>
-<div class="form-submit-row"><div class="form-submit-meta"><strong>Logged in as:</strong> <?php echo htmlspecialchars($name); ?> · <?php echo htmlspecialchars($role); ?><br>Review the product, batch, quantity, and source carefully before saving this inventory IN transaction.</div><button type="submit" class="btn btn-primary btn-lg">Save Inventory IN</button></div>
-</form></section></div>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Inventory IN</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="assets/app.css">
+</head>
+<body>
+<div class="app-shell app-shell-form">
+    <?php render_app_nav($conn, 'Inventory IN', 'Add stock from an existing product master entry or create a new product and its first batch in one controlled workflow.', 'Inventory Transaction'); ?>
+    <section class="card form-page-card">
+        <?php if ($errors): ?>
+            <div class="flash flash-error"><?php foreach ($errors as $error): ?><div><?php echo h($error); ?></div><?php endforeach; ?></div>
+        <?php endif; ?>
+        <form method="post" class="form-page-form">
+            <?php echo csrf_field(); ?>
+            <div class="form-block form-mode-group">
+                <div class="form-section-label">Product Mode</div>
+                <div class="segmented segmented-large">
+                    <label class="segment-card"><input type="radio" name="product_mode" value="existing" <?php echo checked_attr($old['product_mode'], 'existing'); ?> onclick="toggleProductMode('existing')"><span>Existing Product</span></label>
+                    <label class="segment-card"><input type="radio" name="product_mode" value="new" <?php echo checked_attr($old['product_mode'], 'new'); ?> onclick="toggleProductMode('new')"><span>New Product</span></label>
+                </div>
+            </div>
+
+            <div id="existingProductFields" class="form-block">
+                <div class="form-block-head"><h2 class="section-title">Existing product entry</h2><p class="section-subtitle">Choose a product master profile and log a new regular or outsourced batch against it.</p></div>
+                <div class="form-grid">
+                    <div class="field field-full">
+                        <label for="existing_product_id">Product Master</label>
+                        <select name="existing_product_id" id="existing_product_id">
+                            <option value="">Select product</option>
+                            <?php foreach ($products as $product): ?>
+                                <option value="<?php echo (int) $product['id']; ?>" <?php echo selected_attr($old['existing_product_id'], (string) $product['id']); ?>>
+                                    <?php echo h($product['generic_name'] . ' | ' . $product['brand_name'] . ' | ' . $product['dosage_strength'] . ' | ' . $product['manufacturer'] . ' | Barcode: ' . ($product['barcode_value'] ?: 'N/A')); ?>
+                                </option>
+                            <?php endforeach; ?>
+                        </select>
+                    </div>
+                </div>
+            </div>
+
+            <div id="newProductFields" class="form-block">
+                <div class="form-block-head"><h2 class="section-title">New product master</h2><p class="section-subtitle">Create a reusable product profile and immediately create its first tracked batch.</p></div>
+                <div class="form-grid">
+                    <div class="field"><label for="generic_name">Generic Name</label><input id="generic_name" type="text" name="generic_name" value="<?php echo h($old['generic_name']); ?>"></div>
+                    <div class="field"><label for="brand_name">Brand Name</label><input id="brand_name" type="text" name="brand_name" value="<?php echo h($old['brand_name']); ?>"></div>
+                    <div class="field"><label for="dosage_strength">Dosage & Strength</label><input id="dosage_strength" type="text" name="dosage_strength" value="<?php echo h($old['dosage_strength']); ?>"></div>
+                    <div class="field"><label for="manufacturer">Manufacturer</label><input id="manufacturer" type="text" name="manufacturer" value="<?php echo h($old['manufacturer']); ?>"></div>
+                    <div class="field"><label for="registration_no">Registration No</label><input id="registration_no" type="text" name="registration_no" value="<?php echo h($old['registration_no']); ?>"></div>
+                    <div class="field"><label for="default_low_stock_threshold">Default Low Stock Threshold</label><input id="default_low_stock_threshold" type="number" min="1" name="default_low_stock_threshold" value="<?php echo h($old['default_low_stock_threshold']); ?>"></div>
+                    <div class="field"><label for="product_type">Product Type</label><input id="product_type" type="text" name="product_type" value="<?php echo h($old['product_type']); ?>"></div>
+                    <div class="field"><label for="barcode_value">Barcode Value</label><input id="barcode_value" type="text" name="barcode_value" value="<?php echo h($old['barcode_value']); ?>" placeholder="Code39-safe value"></div>
+                </div>
+            </div>
+
+            <div class="form-block">
+                <div class="form-block-head"><h2 class="section-title">Batch details</h2><p class="section-subtitle">Batch metadata is stored in the existing inventory tables while keeping product master data reusable.</p></div>
+                <div class="form-grid">
+                    <div class="field field-full">
+                        <label>Batch Source</label>
+                        <div class="segmented">
+                            <label><input type="radio" name="source" value="regular" <?php echo checked_attr($old['source'], 'regular'); ?> onclick="toggleSourceFields('regular')">Regular</label>
+                            <label><input type="radio" name="source" value="outsourced" <?php echo checked_attr($old['source'], 'outsourced'); ?> onclick="toggleSourceFields('outsourced')">Outsourced</label>
+                        </div>
+                    </div>
+                    <div class="field"><label for="batch_no">Batch No</label><input id="batch_no" type="text" name="batch_no" value="<?php echo h($old['batch_no']); ?>" required></div>
+                    <div class="field"><label for="qty_in">Qty IN</label><input id="qty_in" type="number" min="1" name="qty_in" value="<?php echo h($old['qty_in']); ?>" required></div>
+                    <div class="field"><label for="mfg_date">Manufacturing Date</label><input id="mfg_date" type="date" name="mfg_date" value="<?php echo h($old['mfg_date']); ?>" required></div>
+                    <div class="field"><label for="exp_date">Expiry Date</label><input id="exp_date" type="date" name="exp_date" value="<?php echo h($old['exp_date']); ?>" required></div>
+                    <div class="field"><label for="low_stock_threshold">Batch Low Stock Threshold</label><input id="low_stock_threshold" type="number" min="1" name="low_stock_threshold" value="<?php echo h($old['low_stock_threshold']); ?>"></div>
+                    <div class="field" id="importerField"><label for="importer_name">Importer Name</label><input id="importer_name" type="text" name="importer_name" value="<?php echo h($old['importer_name']); ?>"></div>
+                    <div class="field" id="distributorField"><label for="distributor_name">Distributor Name</label><input id="distributor_name" type="text" name="distributor_name" value="<?php echo h($old['distributor_name']); ?>"></div>
+                    <div class="field field-full"><label for="note_text">Initial Note / Remark</label><textarea id="note_text" name="note_text" rows="4" placeholder="Optional note for this batch or transaction"><?php echo h($old['note_text']); ?></textarea></div>
+                </div>
+            </div>
+
+            <div class="form-submit-row">
+                <div class="form-submit-meta">This action creates the IN transaction, maintains the active quantity, and optionally records notes immediately for the new batch.</div>
+                <button type="submit" class="btn btn-primary btn-lg">Save Inventory IN</button>
+            </div>
+        </form>
+    </section>
+    <?php close_page_stack(); ?>
+</div>
 <script>
-const productDetails = <?php echo json_encode($productDetails); ?>;
-function toggleProductType(type){document.getElementById('product_type').value=type;document.getElementById('existingFields').style.display=type==='existing'?'block':'none';document.getElementById('newFields').style.display=type==='new'?'block':'none';}
-function fillProductDetails(select){const details=productDetails[select.value]||{};document.getElementById('manufacturer_existing').value=details.manufacturer||'';document.getElementById('registration_no_existing').value=details.registration_no||'';}
-function toggleSourceOption(value){const distField=document.getElementById('distributorField'); if(distField){distField.style.display=value==='outsourced'?'block':'none';}}
-window.addEventListener('DOMContentLoaded',()=>{toggleProductType(document.getElementById('product_type').value||'existing');toggleSourceOption('<?php echo htmlspecialchars($old['source']); ?>');const existingSelect=document.getElementById('existing_product'); if(existingSelect&&existingSelect.value){fillProductDetails(existingSelect);}});
+function toggleProductMode(mode) {
+  document.getElementById('existingProductFields').style.display = mode === 'existing' ? 'block' : 'none';
+  document.getElementById('newProductFields').style.display = mode === 'new' ? 'block' : 'none';
+}
+function toggleSourceFields(source) {
+  const showOutsourced = source === 'outsourced';
+  document.getElementById('importerField').style.display = showOutsourced ? 'block' : 'none';
+  document.getElementById('distributorField').style.display = showOutsourced ? 'block' : 'none';
+}
+window.addEventListener('DOMContentLoaded', function () {
+  toggleProductMode('<?php echo h($old['product_mode']); ?>');
+  toggleSourceFields('<?php echo h($old['source']); ?>');
+});
 </script>
-</body></html>
+</body>
+</html>

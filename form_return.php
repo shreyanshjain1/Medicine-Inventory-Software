@@ -1,39 +1,167 @@
 <?php
-require 'db.php';
-session_start();
-if (!isset($_SESSION['user'])) { header("Location: login.php"); exit; }
-$user = $_SESSION['user']; $name = $user['name'];
-$grouped_records = [];
-$sql = "SELECT o.id, i.generic_name, i.brand_name, i.dosage_strength, i.batch_no, o.qty_out, o.qty_returned AS already_returned, o.customer_name, o.document_type, o.document_number, o.created_at, o.return_status FROM out_records o JOIN inventory i ON o.inventory_id = i.id WHERE o.return_status != 'Return full' ORDER BY i.generic_name, i.brand_name, i.dosage_strength, o.created_at DESC";
-$result = $conn->query($sql);
-if ($result && $result->num_rows > 0) {
-    while ($row = $result->fetch_assoc()) {
-        $product_key = $row['generic_name'] . ' - ' . $row['brand_name'] . ' (' . $row['dosage_strength'] . ')';
-        $grouped_records[$product_key][] = $row;
+require_once 'includes/common.php';
+require_login();
+require_permission('inventory.return.create');
+
+$outRecords = db_fetch_all(
+    $conn,
+    'SELECT o.*, i.generic_name, i.brand_name, i.dosage_strength, i.batch_no
+     FROM out_records o
+     INNER JOIN inventory i ON i.id = o.inventory_id
+     WHERE o.record_status = "active"
+     ORDER BY i.generic_name, i.brand_name, i.dosage_strength, o.created_at DESC'
+);
+$groupedRecords = [];
+foreach ($outRecords as $row) {
+    $remaining = (int) ($row['qty_out'] ?? 0) - (int) count_active_returns_for_out($conn, (int) ($row['id'] ?? 0));
+    if ($remaining <= 0) {
+        continue;
     }
+    $row['remaining_returnable'] = $remaining;
+    $productKey = ($row['generic_name'] ?? '') . ' - ' . ($row['brand_name'] ?? '') . ' (' . ($row['dosage_strength'] ?? '') . ')';
+    $groupedRecords[$productKey][] = $row;
 }
-$error=''; $old=['out_record_id'=>$_POST['out_record_id'] ?? '','qty_returned'=>$_POST['qty_returned'] ?? ''];
-if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    $out_record_id=(int)($_POST['out_record_id'] ?? 0); $qty_returned=(int)($_POST['qty_returned'] ?? 0);
-    $stmt=$conn->prepare("SELECT o.inventory_id, o.qty_out, o.qty_returned AS already_returned FROM out_records o WHERE o.id = ?"); $stmt->bind_param("i", $out_record_id); $stmt->execute(); $data=$stmt->get_result()->fetch_assoc(); $stmt->close();
-    if (!$data) $error = "Selected OUT record was not found.";
-    elseif ($qty_returned <= 0) $error = "Quantity returned must be greater than zero.";
-    elseif (($qty_returned + (int)$data['already_returned']) > (int)$data['qty_out']) $error = "Invalid quantity returned or exceeds allowed amount.";
-    else {
-        $stmt=$conn->prepare("UPDATE inventory SET qty = qty + ?, qty_returned = qty_returned + ? WHERE id = ?"); $stmt->bind_param("iii", $qty_returned, $qty_returned, $data['inventory_id']); $stmt->execute(); $stmt->close();
-        $stmt=$conn->prepare("INSERT INTO return_binded_records (out_record_id, qty_returned, returned_by, created_at) VALUES (?, ?, ?, NOW())"); $stmt->bind_param("iis", $out_record_id, $qty_returned, $name); $stmt->execute(); $stmt->close();
-        $new_returned_total = $qty_returned + (int)$data['already_returned'];
-        $return_status = ($new_returned_total == (int)$data['qty_out']) ? 'Return full' : 'Return partial';
-        $stmt=$conn->prepare("UPDATE out_records SET qty_returned = ?, return_status = ? WHERE id = ?"); $stmt->bind_param("isi", $new_returned_total, $return_status, $out_record_id); $stmt->execute(); $stmt->close();
-        header("Location: dashboard.php"); exit;
+
+$error = '';
+$old = [
+    'out_record_id' => trim((string) ($_POST['out_record_id'] ?? '')),
+    'qty_returned' => trim((string) ($_POST['qty_returned'] ?? '')),
+    'note_text' => trim((string) ($_POST['note_text'] ?? '')),
+];
+
+if (request_is_post()) {
+    verify_csrf_or_fail();
+
+    $outRecordId = (int) $old['out_record_id'];
+    $qtyReturned = max(1, (int) $old['qty_returned']);
+    $noteText = $old['note_text'];
+    $out = fetch_out_record_detail($conn, $outRecordId);
+    $activeReturned = count_active_returns_for_out($conn, $outRecordId);
+
+    if (!$out || ($out['record_status'] ?? 'active') !== 'active') {
+        $error = 'Selected OUT record was not found.';
+    } elseif ($qtyReturned + $activeReturned > (int) ($out['qty_out'] ?? 0)) {
+        $error = 'Return quantity exceeds the remaining returnable quantity.';
+    } else {
+        $conn->begin_transaction();
+        try {
+            db_execute(
+                $conn,
+                'UPDATE inventory SET qty = qty + ?, qty_returned = qty_returned + ?, updated_at = NOW() WHERE id = ?',
+                'iii',
+                [$qtyReturned, $qtyReturned, (int) $out['inventory_id']]
+            );
+
+            $actor = current_user_actor();
+            $stmt = $conn->prepare(
+                'INSERT INTO return_binded_records (out_record_id, qty_returned, returned_by, created_at, record_status, updated_at)
+                 VALUES (?, ?, ?, NOW(), "active", NOW())'
+            );
+            $stmt->bind_param('iis', $outRecordId, $qtyReturned, $actor['name']);
+            $stmt->execute();
+            $returnId = (int) $stmt->insert_id;
+            $stmt->close();
+
+            $newReturnedTotal = $activeReturned + $qtyReturned;
+            db_execute(
+                $conn,
+                'UPDATE out_records SET qty_returned = ?, return_status = ? WHERE id = ?',
+                'isi',
+                [$newReturnedTotal, derive_return_status('active', (int) ($out['qty_out'] ?? 0), $newReturnedTotal), $outRecordId]
+            );
+
+            if ($noteText !== '' && user_can('notes.add')) {
+                add_note_record($conn, 'return_record', $returnId, $noteText);
+            }
+
+            log_audit($conn, 'create', 'return_record', $returnId, 'Created RETURN transaction', null, [], [
+                'out_record_id' => $outRecordId,
+                'qty_returned' => $qtyReturned,
+            ]);
+
+            $conn->commit();
+            set_flash('success', 'Inventory RETURN saved successfully.');
+            redirect('dashboard.php');
+        } catch (Throwable $exception) {
+            $conn->rollback();
+            $error = 'Unable to save the RETURN transaction: ' . $exception->getMessage();
+        }
     }
 }
 ?>
-<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Inventory RETURN</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet"><link rel="stylesheet" href="assets/app.css"></head><body>
-<div class="app-shell app-shell-form"><section class="card form-page-card"><div class="form-page-top"><div><div class="eyebrow">Inventory Transaction</div><h1 class="hero-page-title">Inventory RETURN</h1><p class="hero-page-subtitle">Bind returns directly to the original OUT record to preserve movement history.</p></div><a class="btn btn-soft" href="dashboard.php">Back to Dashboard</a></div>
-<?php if ($error): ?><div class="flash flash-error"><?php echo htmlspecialchars($error); ?></div><?php endif; ?>
-<form method="POST" class="form-page-form"><div class="form-block"><div class="form-block-head"><h2 class="section-title">Return details</h2><p class="section-subtitle">Search the original OUT record, then enter only the quantity being returned now.</p></div><div class="form-grid"><div class="field field-full"><label for="out_record_id">OUT Record</label><select name="out_record_id" id="out_record_id" required onchange="updateReturnPreview()"><option value="">Select an OUT record</option><?php foreach ($grouped_records as $product => $outs): ?><optgroup label="<?php echo htmlspecialchars($product); ?>"><?php foreach ($outs as $record): ?><option value="<?php echo (int)$record['id']; ?>" data-batch="<?php echo htmlspecialchars($record['batch_no']); ?>" data-customer="<?php echo htmlspecialchars($record['customer_name']); ?>" data-reference="<?php echo htmlspecialchars($record['document_type'] . '-' . $record['document_number']); ?>" data-qty-out="<?php echo (int)$record['qty_out']; ?>" data-already-returned="<?php echo (int)$record['already_returned']; ?>" data-remaining="<?php echo (int)$record['qty_out'] - (int)$record['already_returned']; ?>" <?php echo (string)$old['out_record_id'] === (string)$record['id'] ? 'selected' : ''; ?>><?php echo htmlspecialchars('To: ' . $record['customer_name'] . ' | ' . $record['document_type'] . '-' . $record['document_number'] . ' | Qty Out: ' . $record['qty_out'] . ' | Returned: ' . (int)$record['already_returned'] . ' | Batch: ' . $record['batch_no'] . ' | ' . date('M d, Y', strtotime($record['created_at']))); ?></option><?php endforeach; ?></optgroup><?php endforeach; ?></select></div><div class="field"><label for="qty_returned">Quantity Returned</label><input type="number" id="qty_returned" name="qty_returned" min="1" value="<?php echo htmlspecialchars($old['qty_returned']); ?>" placeholder="Enter quantity to return now" required></div></div></div><div class="form-preview-grid"><div class="preview-chip"><span>Batch</span><strong id="previewBatch">—</strong></div><div class="preview-chip"><span>Customer</span><strong id="previewCustomer">—</strong></div><div class="preview-chip"><span>Reference</span><strong id="previewReference">—</strong></div><div class="preview-chip"><span>Qty Out</span><strong id="previewQtyOut">—</strong></div><div class="preview-chip"><span>Already Returned</span><strong id="previewAlreadyReturned">—</strong></div><div class="preview-chip"><span>Remaining Returnable</span><strong id="previewRemaining">—</strong></div></div><div class="form-submit-row"><div class="form-submit-meta">This return will update both the inventory quantity and the linked OUT record return status.</div><button type="submit" class="btn btn-warning btn-lg">Save Return</button></div></form></section></div>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Inventory RETURN</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="assets/app.css">
+</head>
+<body>
+<div class="app-shell app-shell-form">
+    <?php render_app_nav($conn, 'Inventory RETURN', 'Bind returns directly to the original OUT record so stock and traceability stay synchronized.', 'Inventory Transaction'); ?>
+    <section class="card form-page-card">
+        <?php if ($error !== ''): ?><div class="flash flash-error"><?php echo h($error); ?></div><?php endif; ?>
+        <form method="post" class="form-page-form">
+            <?php echo csrf_field(); ?>
+            <div class="form-block">
+                <div class="form-block-head"><h2 class="section-title">Return details</h2><p class="section-subtitle">Search the original release, then post only the quantity being returned now.</p></div>
+                <div class="form-grid">
+                    <div class="field field-full">
+                        <label for="out_record_id">OUT Record</label>
+                        <select name="out_record_id" id="out_record_id" required onchange="updateReturnPreview()">
+                            <option value="">Select an OUT record</option>
+                            <?php foreach ($groupedRecords as $product => $rows): ?>
+                                <optgroup label="<?php echo h($product); ?>">
+                                    <?php foreach ($rows as $record): ?>
+                                        <option value="<?php echo (int) $record['id']; ?>" data-batch="<?php echo h((string) $record['batch_no']); ?>" data-customer="<?php echo h((string) $record['customer_name']); ?>" data-reference="<?php echo h((string) ($record['document_type'] . '-' . $record['document_number'])); ?>" data-qty-out="<?php echo (int) $record['qty_out']; ?>" data-returned="<?php echo (int) count_active_returns_for_out($conn, (int) $record['id']); ?>" data-remaining="<?php echo (int) $record['remaining_returnable']; ?>" <?php echo selected_attr($old['out_record_id'], (string) $record['id']); ?>>
+                                            <?php echo h('To: ' . $record['customer_name'] . ' | ' . $record['document_type'] . '-' . $record['document_number'] . ' | Qty Out: ' . $record['qty_out'] . ' | Remaining: ' . $record['remaining_returnable'] . ' | Batch: ' . $record['batch_no']); ?>
+                                        </option>
+                                    <?php endforeach; ?>
+                                </optgroup>
+                            <?php endforeach; ?>
+                        </select>
+                    </div>
+                    <div class="field"><label for="qty_returned">Quantity Returned</label><input id="qty_returned" type="number" min="1" name="qty_returned" value="<?php echo h($old['qty_returned']); ?>" required></div>
+                    <div class="field field-full"><label for="note_text">Remark / Note</label><textarea id="note_text" name="note_text" rows="4" placeholder="Optional note for this RETURN transaction"><?php echo h($old['note_text']); ?></textarea></div>
+                </div>
+            </div>
+            <div class="form-preview-grid">
+                <div class="preview-chip"><span>Batch</span><strong id="previewBatch">-</strong></div>
+                <div class="preview-chip"><span>Customer</span><strong id="previewCustomer">-</strong></div>
+                <div class="preview-chip"><span>Reference</span><strong id="previewReference">-</strong></div>
+                <div class="preview-chip"><span>Qty Out</span><strong id="previewQtyOut">-</strong></div>
+                <div class="preview-chip"><span>Already Returned</span><strong id="previewAlreadyReturned">-</strong></div>
+                <div class="preview-chip"><span>Remaining Returnable</span><strong id="previewRemaining">-</strong></div>
+            </div>
+            <div class="form-submit-row">
+                <div class="form-submit-meta">Managers and admins can later correct or void the return with a required reason. Staff can create and annotate the return.</div>
+                <button type="submit" class="btn btn-warning btn-lg">Save Return</button>
+            </div>
+        </form>
+    </section>
+    <?php close_page_stack(); ?>
+</div>
 <script>
-function updateReturnPreview(){const select=document.getElementById('out_record_id'); const option=select.options[select.selectedIndex]; const map={previewBatch:(option&&option.value)?option.getAttribute('data-batch'):'—',previewCustomer:(option&&option.value)?option.getAttribute('data-customer'):'—',previewReference:(option&&option.value)?option.getAttribute('data-reference'):'—',previewQtyOut:(option&&option.value)?option.getAttribute('data-qty-out'):'—',previewAlreadyReturned:(option&&option.value)?option.getAttribute('data-already-returned'):'—',previewRemaining:(option&&option.value)?option.getAttribute('data-remaining'):'—'}; Object.keys(map).forEach((id)=>{const el=document.getElementById(id); if(el) el.textContent=map[id];});}
+function updateReturnPreview() {
+  const select = document.getElementById('out_record_id');
+  const option = select.options[select.selectedIndex];
+  const map = {
+    previewBatch: option && option.value ? option.getAttribute('data-batch') : '-',
+    previewCustomer: option && option.value ? option.getAttribute('data-customer') : '-',
+    previewReference: option && option.value ? option.getAttribute('data-reference') : '-',
+    previewQtyOut: option && option.value ? option.getAttribute('data-qty-out') : '-',
+    previewAlreadyReturned: option && option.value ? option.getAttribute('data-returned') : '-',
+    previewRemaining: option && option.value ? option.getAttribute('data-remaining') : '-'
+  };
+  Object.keys(map).forEach(function (id) {
+    document.getElementById(id).textContent = map[id];
+  });
+}
 window.addEventListener('DOMContentLoaded', updateReturnPreview);
-</script></body></html>
+</script>
+</body>
+</html>

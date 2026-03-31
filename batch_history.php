@@ -1,87 +1,232 @@
 <?php
 require_once 'includes/common.php';
 require_login();
+require_permission('history.view');
 
-$batchNo = trim($_GET['batch'] ?? '');
-$item = null;
-$itemSource = 'inventory';
-$outRecords = [];
-$returnRecords = [];
-$inLog = null;
-$summary = ['total_out' => 0, 'total_returned' => 0, 'remaining' => 0];
+$batchNo = trim((string) ($_GET['batch'] ?? ''));
 $error = '';
 
-if ($batchNo !== '') {
-    $stmt = $conn->prepare('SELECT *, NULL AS distributor_name FROM inventory WHERE batch_no = ? LIMIT 1');
-    $stmt->bind_param('s', $batchNo);
-    $stmt->execute();
-    $item = $stmt->get_result()->fetch_assoc();
-    $stmt->close();
-
-    if (!$item) {
-        $stmt = $conn->prepare('SELECT * FROM inventory_outsourced WHERE batch_no = ? LIMIT 1');
-        $stmt->bind_param('s', $batchNo);
-        $stmt->execute();
-        $item = $stmt->get_result()->fetch_assoc();
-        $stmt->close();
-        $itemSource = 'inventory_outsourced';
+if (request_is_post()) {
+    verify_csrf_or_fail();
+    if (!user_can('reversals.manage')) {
+        set_flash('error', 'You do not have permission to void IN batches.');
+        redirect('batch_history.php?batch=' . urlencode($batchNo));
     }
 
-    if ($item) {
-        $stmt = $conn->prepare('SELECT added_by, added_at FROM in_log WHERE batch_no = ? ORDER BY added_at ASC LIMIT 1');
-        $stmt->bind_param('s', $batchNo);
-        $stmt->execute();
-        $inLog = $stmt->get_result()->fetch_assoc();
-        $stmt->close();
-
-        if ($itemSource === 'inventory') {
-            $stmt = $conn->prepare('SELECT * FROM out_records WHERE inventory_id = ? ORDER BY created_at DESC');
-            $stmt->bind_param('i', $item['id']);
-            $stmt->execute();
-            $outRecords = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
-            $stmt->close();
-
-            $stmt = $conn->prepare('SELECT r.*, o.document_number, o.document_type, o.customer_name FROM return_binded_records r JOIN out_records o ON r.out_record_id = o.id WHERE o.inventory_id = ? ORDER BY r.created_at DESC');
-            $stmt->bind_param('i', $item['id']);
-            $stmt->execute();
-            $returnRecords = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
-            $stmt->close();
+    $action = trim((string) ($_POST['action'] ?? ''));
+    if ($action === 'void_batch') {
+        $sourceKey = trim((string) ($_POST['source_key'] ?? 'regular'));
+        $batchId = (int) ($_POST['batch_id'] ?? 0);
+        $reason = trim((string) ($_POST['reason'] ?? ''));
+        $errors = [];
+        if ($reason === '') {
+            $errors[] = 'A reason is required to void an IN batch.';
+        } elseif (!void_in_batch($conn, $sourceKey, $batchId, $reason, $errors)) {
+            if (!$errors) {
+                $errors[] = 'Unable to void the batch.';
+            }
         }
 
-        $summary['total_out'] = (int) array_sum(array_column($outRecords, 'qty_out'));
-        $summary['total_returned'] = (int) array_sum(array_column($returnRecords, 'qty_returned'));
-        $summary['remaining'] = $summary['total_out'] - $summary['total_returned'];
-    } else {
-        $error = 'Batch not found. Please check the batch number and try again.';
+        if ($errors) {
+            set_flash('error', implode(' ', $errors));
+        } else {
+            set_flash('success', 'IN batch voided successfully.');
+        }
+        redirect('batch_history.php?batch=' . urlencode($batchNo));
     }
 }
 
-function history_badge_class($value)
+$bundle = $batchNo !== '' ? fetch_batch_history_bundle($conn, $batchNo) : ['batch' => null, 'in_log' => null, 'out_records' => [], 'return_records' => [], 'summary' => ['active_out' => 0, 'active_returned' => 0, 'voided_out' => 0, 'voided_returns' => 0]];
+$batch = $bundle['batch'];
+$inLog = $bundle['in_log'];
+$outRecords = $bundle['out_records'];
+$returnRecords = $bundle['return_records'];
+$summary = $bundle['summary'];
+$batchNotes = $batch ? fetch_notes($conn, $batch['target_type'], (int) $batch['id']) : [];
+
+if ($batchNo !== '' && !$batch) {
+    $error = 'Batch not found. Please check the batch number and try again.';
+}
+
+function history_badge_class(string $status): string
 {
-    $value = strtoupper((string) $value);
-    if ($value === 'RETURNED' || $value === 'PARTIAL RETURN' || $value === 'PARTIALLY RETURNED' || $value === 'RETURN PARTIAL' || $value === 'RETURN FULL') {
-        return 'badge-orange';
-    }
-    if ($value === 'NO RETURN YET' || $value === '') {
-        return 'badge-blue';
-    }
-    return 'badge-green';
+    $status = strtolower(trim($status));
+    return match ($status) {
+        'voided' => 'badge-red',
+        'return partial', 'return full' => 'badge-orange',
+        'delivered', 'active' => 'badge-green',
+        default => 'badge-blue',
+    };
 }
-
-$currentAvailable = (int) ($item['qty'] ?? 0);
-$totalOut = (int) $summary['total_out'];
-$totalReturned = (int) $summary['total_returned'];
-$netOutstanding = (int) $summary['remaining'];
-$batchTitle = $item ? trim(($item['generic_name'] ?? '') . ' • ' . ($item['brand_name'] ?? '') . ' • ' . ($item['dosage_strength'] ?? '')) : '';
 ?>
-<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Batch History</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet"><link rel="stylesheet" href="assets/app.css"></head><body>
-<div class="app-shell"><div class="page-stack">
-<section class="card batch-hero"><div class="batch-hero-top"><div><div class="eyebrow">Traceability & Movement History</div><h1 class="hero-page-title">Batch History</h1><p class="hero-page-subtitle">Search a batch number and review its full IN, OUT, and RETURN history in one readable screen.</p></div><a class="btn btn-soft" href="dashboard.php">Back to Dashboard</a></div>
-<form method="get" class="batch-search-form"><div class="field batch-search-field"><label for="batch">Batch Number</label><input id="batch" type="text" name="batch" value="<?php echo h($batchNo); ?>" placeholder="Enter batch number" required></div><button class="btn btn-primary" type="submit">Search Batch</button></form><?php if ($error): ?><div class="flash flash-error" style="margin-top:14px;"><?php echo h($error); ?></div><?php endif; ?></section>
-<?php if ($item): ?>
-<section class="batch-summary-grid"><div class="card batch-kpi batch-kpi-primary"><div class="batch-kpi-label">Current Available</div><div class="batch-kpi-value"><?php echo number_format($currentAvailable); ?></div><div class="batch-kpi-sub">Live quantity from the source inventory table</div></div><div class="card batch-kpi"><div class="batch-kpi-label">Total OUT</div><div class="batch-kpi-value"><?php echo number_format($totalOut); ?></div><div class="batch-kpi-sub">Total quantity released from this batch</div></div><div class="card batch-kpi"><div class="batch-kpi-label">Total Returned</div><div class="batch-kpi-value"><?php echo number_format($totalReturned); ?></div><div class="batch-kpi-sub">Total linked return quantity received back</div></div><div class="card batch-kpi"><div class="batch-kpi-label">Net Outstanding</div><div class="batch-kpi-value"><?php echo number_format($netOutstanding); ?></div><div class="batch-kpi-sub">OUT minus RETURN history</div></div></section>
-<section class="card batch-detail-card"><div class="batch-detail-top"><div><div class="batch-title-row"><h2 class="section-title">Batch <?php echo h($batchNo); ?></h2><span class="badge badge-blue"><?php echo h($itemSource === 'inventory_outsourced' ? 'Outsourced Source' : 'Regular Source'); ?></span></div><p class="section-subtitle"><?php echo h($batchTitle); ?></p></div><div class="inline-actions"><a class="btn btn-outline" href="export_batch_excel.php?batch_no=<?php echo urlencode($batchNo); ?>">Export Excel</a><a class="btn btn-outline" target="_blank" href="export_batch_pdf.php?batch_no=<?php echo urlencode($batchNo); ?>">Open PDF View</a></div></div>
-<div class="batch-meta-grid"><div class="batch-meta-box"><span class="batch-meta-label">Manufacturer</span><strong><?php echo h($item['manufacturer']); ?></strong></div><div class="batch-meta-box"><span class="batch-meta-label">Registration No</span><strong><?php echo h($item['registration_no']); ?></strong></div><div class="batch-meta-box"><span class="batch-meta-label">Manufacturing Date</span><strong><?php echo h($item['mfg_date']); ?></strong></div><div class="batch-meta-box"><span class="batch-meta-label">Expiry Date</span><strong><?php echo h($item['exp_date']); ?></strong></div><div class="batch-meta-box"><span class="batch-meta-label">Logged IN By</span><strong><?php echo h($inLog['added_by'] ?? 'N/A'); ?></strong></div><div class="batch-meta-box"><span class="batch-meta-label">Logged IN At</span><strong><?php echo h(isset($inLog['added_at']) ? date('M d, Y h:i A', strtotime($inLog['added_at'])) : 'N/A'); ?></strong></div><?php if (!empty($item['distributor_name'])): ?><div class="batch-meta-box"><span class="batch-meta-label">Distributor</span><strong><?php echo h($item['distributor_name']); ?></strong></div><?php endif; ?></div></section>
-<section class="batch-history-grid"><div class="card history-card"><div class="history-card-top"><div><h2 class="section-title">OUT Records</h2><p class="section-subtitle">All released movement rows for this batch.</p></div><div class="history-metric-chip history-out-chip"><span>Total OUT Qty</span><strong><?php echo number_format($totalOut); ?></strong></div></div><div class="table-wrap table-wrap-readable"><table class="data-table data-table-readable"><thead><tr><th>#</th><th>Date</th><th>Customer</th><th>Doc Type</th><th>Doc No</th><th class="ta-right qty-col-header">Qty Out</th><th>Return Status</th><th>Added By</th></tr></thead><tbody><?php if ($outRecords): foreach ($outRecords as $index => $out): $returnStatus = trim((string)($out['return_status'] ?? '')); if ($returnStatus === '') $returnStatus = 'No return yet'; ?><tr><td class="row-index"><?php echo $index + 1; ?></td><td><?php echo h(date('M d, Y h:i A', strtotime($out['created_at']))); ?></td><td><?php echo h($out['customer_name']); ?></td><td><?php echo h($out['document_type']); ?></td><td><?php echo h($out['document_number']); ?></td><td class="ta-right qty-cell qty-out"><?php echo number_format((int)$out['qty_out']); ?></td><td><span class="badge <?php echo history_badge_class($returnStatus); ?>"><?php echo h($returnStatus); ?></span></td><td><?php echo h($out['added_by']); ?></td></tr><?php endforeach; else: ?><tr><td colspan="8" class="empty-state">No OUT history found for this batch.</td></tr><?php endif; ?></tbody></table></div></div>
-<div class="card history-card"><div class="history-card-top"><div><h2 class="section-title">RETURN Records</h2><p class="section-subtitle">All linked returns mapped back to this batch.</p></div><div class="history-metric-chip history-return-chip"><span>Total Returned Qty</span><strong><?php echo number_format($totalReturned); ?></strong></div></div><div class="table-wrap table-wrap-readable"><table class="data-table data-table-readable"><thead><tr><th>#</th><th>Date</th><th>Customer</th><th>Reference</th><th class="ta-right qty-col-header">Qty Returned</th><th>Returned By</th></tr></thead><tbody><?php if ($returnRecords): foreach ($returnRecords as $index => $ret): ?><tr><td class="row-index"><?php echo $index + 1; ?></td><td><?php echo h(date('M d, Y h:i A', strtotime($ret['created_at']))); ?></td><td><?php echo h($ret['customer_name']); ?></td><td><?php echo h($ret['document_type'] . ' - ' . $ret['document_number']); ?></td><td class="ta-right qty-cell qty-return"><?php echo number_format((int)$ret['qty_returned']); ?></td><td><?php echo h($ret['returned_by']); ?></td></tr><?php endforeach; else: ?><tr><td colspan="6" class="empty-state">No RETURN history found for this batch.</td></tr><?php endif; ?></tbody></table></div></div></section>
-<?php endif; ?></div></div></body></html>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Batch History</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="assets/app.css">
+</head>
+<body>
+<div class="app-shell">
+    <?php render_app_nav($conn, 'Batch History', 'Search any batch number to inspect its IN source, OUT releases, RETURN records, notes, labels, and current status.', 'Traceability & Movement History'); ?>
+    <section class="card batch-hero">
+        <div class="batch-hero-top">
+            <div>
+                <h2 class="section-title">Batch lookup</h2>
+                <p class="section-subtitle">Search a batch number and review its full movement record.</p>
+            </div>
+        </div>
+        <form method="get" class="batch-search-form">
+            <div class="field batch-search-field"><label for="batch">Batch Number</label><input id="batch" type="text" name="batch" value="<?php echo h($batchNo); ?>" placeholder="Enter batch number" required></div>
+            <button class="btn btn-primary" type="submit">Search Batch</button>
+        </form>
+        <?php if ($error !== ''): ?><div class="flash flash-error" style="margin-top:14px;"><?php echo h($error); ?></div><?php endif; ?>
+    </section>
+
+    <?php if ($batch): ?>
+        <section class="batch-summary-grid">
+            <div class="card batch-kpi batch-kpi-primary"><div class="batch-kpi-label">Current Available</div><div class="batch-kpi-value"><?php echo number_format((int) $batch['qty']); ?></div><div class="batch-kpi-sub">Live active quantity for this batch</div></div>
+            <div class="card batch-kpi"><div class="batch-kpi-label">Active OUT</div><div class="batch-kpi-value"><?php echo number_format((int) $summary['active_out']); ?></div><div class="batch-kpi-sub">Released quantity from active OUT records</div></div>
+            <div class="card batch-kpi"><div class="batch-kpi-label">Active Returned</div><div class="batch-kpi-value"><?php echo number_format((int) $summary['active_returned']); ?></div><div class="batch-kpi-sub">Returned quantity on active RETURN rows</div></div>
+            <div class="card batch-kpi"><div class="batch-kpi-label">Record Status</div><div class="batch-kpi-value"><?php echo h(ucfirst((string) ($batch['record_status'] ?? 'active'))); ?></div><div class="batch-kpi-sub"><?php echo h($batch['source_type']); ?> source</div></div>
+        </section>
+
+        <section class="card batch-detail-card">
+            <div class="batch-detail-top">
+                <div>
+                    <div class="batch-title-row">
+                        <h2 class="section-title">Batch <?php echo h($batch['batch_no']); ?></h2>
+                        <span class="badge badge-blue"><?php echo h($batch['source_type']); ?></span>
+                        <span class="badge <?php echo history_badge_class((string) ($batch['record_status'] ?? 'active')); ?>"><?php echo h(ucfirst((string) ($batch['record_status'] ?? 'active'))); ?></span>
+                    </div>
+                    <p class="section-subtitle"><?php echo h(product_display_name($batch)); ?></p>
+                </div>
+                <div class="inline-actions">
+                    <a class="btn btn-outline" href="export_batch_excel.php?batch_no=<?php echo urlencode((string) $batch['batch_no']); ?>">Export CSV</a>
+                    <?php if (user_can('barcode.view')): ?><a class="btn btn-outline" href="label_print.php?type=batch&source=<?php echo urlencode((string) $batch['source_key']); ?>&id=<?php echo (int) $batch['id']; ?>" target="_blank">Print Label</a><?php endif; ?>
+                    <?php if (user_can('corrections.manage')): ?><a class="btn btn-soft" href="edit_record.php?type=batch&source=<?php echo urlencode((string) $batch['source_key']); ?>&id=<?php echo (int) $batch['id']; ?>">Correct Batch</a><?php endif; ?>
+                </div>
+            </div>
+            <div class="batch-meta-grid">
+                <div class="batch-meta-box"><span class="batch-meta-label">Manufacturer</span><strong><?php echo h((string) $batch['manufacturer']); ?></strong></div>
+                <div class="batch-meta-box"><span class="batch-meta-label">Registration No</span><strong><?php echo h((string) $batch['registration_no']); ?></strong></div>
+                <div class="batch-meta-box"><span class="batch-meta-label">Manufacturing Date</span><strong><?php echo h((string) $batch['mfg_date']); ?></strong></div>
+                <div class="batch-meta-box"><span class="batch-meta-label">Expiry Date</span><strong><?php echo h((string) $batch['exp_date']); ?></strong></div>
+                <div class="batch-meta-box"><span class="batch-meta-label">Logged IN By</span><strong><?php echo h((string) ($inLog['added_by'] ?? 'N/A')); ?></strong></div>
+                <div class="batch-meta-box"><span class="batch-meta-label">Logged IN At</span><strong><?php echo h(format_datetime($inLog['added_at'] ?? '')); ?></strong></div>
+                <?php if (!empty($batch['distributor_name'])): ?><div class="batch-meta-box"><span class="batch-meta-label">Distributor</span><strong><?php echo h((string) $batch['distributor_name']); ?></strong></div><?php endif; ?>
+                <?php if (!empty($batch['importer_name'])): ?><div class="batch-meta-box"><span class="batch-meta-label">Importer</span><strong><?php echo h((string) $batch['importer_name']); ?></strong></div><?php endif; ?>
+                <div class="batch-meta-box"><span class="batch-meta-label">Barcode</span><strong><?php echo h((string) ($batch['barcode_value'] ?: $batch['batch_no'])); ?></strong></div>
+            </div>
+            <?php if (user_can('reversals.manage') && ($batch['record_status'] ?? 'active') === 'active'): ?>
+                <form method="post" class="void-form">
+                    <?php echo csrf_field(); ?>
+                    <input type="hidden" name="action" value="void_batch">
+                    <input type="hidden" name="source_key" value="<?php echo h((string) $batch['source_key']); ?>">
+                    <input type="hidden" name="batch_id" value="<?php echo (int) $batch['id']; ?>">
+                    <div class="form-grid" style="margin-top:18px;">
+                        <div class="field field-full"><label for="void_reason">Void IN Batch Reason</label><textarea id="void_reason" name="reason" rows="3" placeholder="Required reason for voiding this untouched IN batch"></textarea></div>
+                        <div class="field field-full"><button class="btn btn-danger" type="submit">Void IN Batch</button></div>
+                    </div>
+                </form>
+            <?php endif; ?>
+        </section>
+
+        <section class="batch-history-grid">
+            <div class="card history-card">
+                <div class="history-card-top"><div><h2 class="section-title">OUT Records</h2><p class="section-subtitle">All release movements for this batch, including void status.</p></div><div class="history-metric-chip history-out-chip"><span>Active OUT Qty</span><strong><?php echo number_format((int) $summary['active_out']); ?></strong></div></div>
+                <div class="table-wrap table-wrap-readable">
+                    <table class="data-table data-table-readable">
+                        <thead><tr><th>#</th><th>Date</th><th>Customer</th><th>Doc Type</th><th>Doc No</th><th class="ta-right qty-col-header">Qty Out</th><th>Status</th><th>Added By</th><th>Action</th></tr></thead>
+                        <tbody>
+                        <?php if ($outRecords): foreach ($outRecords as $index => $out): ?>
+                            <tr>
+                                <td class="row-index"><?php echo $index + 1; ?></td>
+                                <td><?php echo h(format_datetime($out['created_at'] ?? '')); ?></td>
+                                <td><?php echo h((string) $out['customer_name']); ?></td>
+                                <td><?php echo h((string) $out['document_type']); ?></td>
+                                <td><?php echo h((string) $out['document_number']); ?></td>
+                                <td class="ta-right qty-cell qty-out"><?php echo number_format((int) $out['qty_out']); ?></td>
+                                <td><span class="badge <?php echo history_badge_class((string) (($out['record_status'] ?? 'active') === 'voided' ? 'voided' : ($out['return_status'] ?? 'delivered'))); ?>"><?php echo h(($out['record_status'] ?? 'active') === 'voided' ? 'Voided' : (string) ($out['return_status'] ?? 'Delivered')); ?></span></td>
+                                <td><?php echo h((string) $out['added_by']); ?></td>
+                                <td><a class="btn btn-mini btn-soft" href="transaction_detail.php?type=out&id=<?php echo (int) $out['id']; ?>">Open</a></td>
+                            </tr>
+                        <?php endforeach; else: ?>
+                            <tr><td colspan="9" class="empty-state">No OUT history found for this batch.</td></tr>
+                        <?php endif; ?>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <div class="card history-card">
+                <div class="history-card-top"><div><h2 class="section-title">RETURN Records</h2><p class="section-subtitle">All linked returns mapped back to the original release rows.</p></div><div class="history-metric-chip history-return-chip"><span>Active Returned Qty</span><strong><?php echo number_format((int) $summary['active_returned']); ?></strong></div></div>
+                <div class="table-wrap table-wrap-readable">
+                    <table class="data-table data-table-readable">
+                        <thead><tr><th>#</th><th>Date</th><th>Customer</th><th>Reference</th><th class="ta-right qty-col-header">Qty Returned</th><th>Status</th><th>Returned By</th><th>Action</th></tr></thead>
+                        <tbody>
+                        <?php if ($returnRecords): foreach ($returnRecords as $index => $ret): ?>
+                            <tr>
+                                <td class="row-index"><?php echo $index + 1; ?></td>
+                                <td><?php echo h(format_datetime($ret['created_at'] ?? '')); ?></td>
+                                <td><?php echo h((string) $ret['customer_name']); ?></td>
+                                <td><?php echo h((string) ($ret['document_type'] . ' - ' . $ret['document_number'])); ?></td>
+                                <td class="ta-right qty-cell qty-return"><?php echo number_format((int) $ret['qty_returned']); ?></td>
+                                <td><span class="badge <?php echo history_badge_class((string) ($ret['record_status'] ?? 'active')); ?>"><?php echo h(($ret['record_status'] ?? 'active') === 'voided' ? 'Voided' : 'Active'); ?></span></td>
+                                <td><?php echo h((string) $ret['returned_by']); ?></td>
+                                <td><a class="btn btn-mini btn-soft" href="transaction_detail.php?type=return&id=<?php echo (int) $ret['id']; ?>">Open</a></td>
+                            </tr>
+                        <?php endforeach; else: ?>
+                            <tr><td colspan="8" class="empty-state">No RETURN history found for this batch.</td></tr>
+                        <?php endif; ?>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </section>
+
+        <section class="card notes-card">
+            <div class="section-header"><div><h2 class="section-title">Batch Notes</h2><p class="section-subtitle">Operational remarks attached directly to this batch record.</p></div></div>
+            <?php if (user_can('notes.add')): ?>
+                <form method="post" action="notes_action.php" class="note-form">
+                    <?php echo csrf_field(); ?>
+                    <input type="hidden" name="action" value="add">
+                    <input type="hidden" name="target_type" value="<?php echo h((string) $batch['target_type']); ?>">
+                    <input type="hidden" name="target_id" value="<?php echo (int) $batch['id']; ?>">
+                    <input type="hidden" name="redirect_url" value="<?php echo h('batch_history.php?batch=' . urlencode((string) $batch['batch_no'])); ?>">
+                    <div class="field"><label for="batch_note_text">Add Note</label><textarea id="batch_note_text" name="note_text" rows="4" placeholder="Add a batch remark, storage reminder, correction context, or handling note"></textarea></div>
+                    <button class="btn btn-primary" type="submit">Save Note</button>
+                </form>
+            <?php endif; ?>
+            <div class="notes-list">
+                <?php if ($batchNotes): foreach ($batchNotes as $note): ?>
+                        <div class="note-item">
+                            <div class="note-meta"><strong><?php echo h((string) $note['created_by']); ?></strong><span><?php echo h(format_datetime($note['created_at'] ?? '')); ?></span></div>
+                            <div class="note-body"><?php echo nl2br(h((string) $note['note_text'])); ?></div>
+                            <?php if (can_manage_note_record($note)): ?>
+                                <div class="inline-actions">
+                                    <a class="btn btn-soft btn-mini" href="note_edit.php?id=<?php echo (int) $note['id']; ?>&redirect=<?php echo urlencode('batch_history.php?batch=' . (string) $batch['batch_no']); ?>">Edit</a>
+                                    <form method="post" action="notes_action.php">
+                                        <?php echo csrf_field(); ?>
+                                        <input type="hidden" name="action" value="delete">
+                                    <input type="hidden" name="note_id" value="<?php echo (int) $note['id']; ?>">
+                                    <input type="hidden" name="redirect_url" value="<?php echo h('batch_history.php?batch=' . urlencode((string) $batch['batch_no'])); ?>">
+                                    <button class="btn btn-outline btn-mini" type="submit">Delete</button>
+                                </form>
+                            </div>
+                        <?php endif; ?>
+                    </div>
+                <?php endforeach; else: ?>
+                    <div class="empty-state">No notes yet for this batch.</div>
+                <?php endif; ?>
+            </div>
+        </section>
+    <?php endif; ?>
+    <?php close_page_stack(); ?>
+</div>
+</body>
+</html>
